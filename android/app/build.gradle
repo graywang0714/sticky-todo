@@ -1,0 +1,25 @@
+plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+android {
+ namespace 'com.gray.sticky.nativeapp'
+ compileSdk 34
+ testOptions.unitTests.includeAndroidResources=true
+ testOptions.unitTests.all { forkEvery = 1; systemProperty 'robolectric.dependency.repo.url','https://repo.maven.apache.org/maven2'; ['https.proxyHost','https.proxyPort','http.proxyHost','http.proxyPort'].each { k -> if(System.getProperty(k)) systemProperty k, System.getProperty(k) } }
+ defaultConfig { applicationId 'com.gray.sticky.nativeapp'; minSdk 26; targetSdk 34; versionCode 7; versionName '0.6.0' }
+ sourceSets { main.java.srcDirs += 'src/main/java' }
+ buildFeatures { compose true }
+ composeOptions { kotlinCompilerExtensionVersion '1.5.14' }
+ compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+ kotlinOptions { jvmTarget='17' }
+}
+dependencies {
+ implementation 'androidx.activity:activity-compose:1.8.2'
+ implementation 'androidx.compose.material3:material3:1.2.1'
+ implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+ testImplementation 'org.json:json:20240303'
+ testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+ implementation 'androidx.room:room-runtime:2.6.1'
+ annotationProcessor 'androidx.room:room-compiler:2.6.1'
+ testImplementation 'junit:junit:4.13.2'
+ testImplementation 'org.robolectric:robolectric:4.12.2'
+ testImplementation 'androidx.compose.ui:ui-test-junit4:1.6.0'
+}

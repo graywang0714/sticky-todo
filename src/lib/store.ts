@@ -1,4 +1,7 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import { createClient, type SupabaseClient, type Session } from '@supabase/supabase-js'
+import { Ledger, ROOT, spaceId } from './ledger'
+import type {Kind,Op,Row} from './ledger'
+import {AccountApi,reconcile} from './desktop-sync'
 
 export interface Todo {
   id: string
@@ -21,10 +24,7 @@ export interface Note {
 
 export type SyncStatus = 'local' | 'connecting' | 'online' | 'error' | 'need-auth'
 
-const LS_TODOS = 'sticky-todo-items'
-const LS_NOTES = 'sticky-todo-notes'
 const LS_CFG = 'sticky-todo-supabase'
-const LS_OWNER = 'sticky-todo-owner'
 
 export interface SupabaseCfg { url: string; key: string }
 
@@ -51,296 +51,87 @@ export function saveCfg(cfg: SupabaseCfg | null) {
   }
 }
 
-function loadJson<T>(key: string): T[] {
-  try { return JSON.parse(localStorage.getItem(key) || '[]') } catch { return [] }
-}
-function saveJson(key: string, v: unknown) {
-  localStorage.setItem(key, JSON.stringify(v))
-}
-
-export function uid(): string {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-}
-
+export const uid=()=>crypto.randomUUID()
 export class TodoStore {
-  todos: Todo[] = []
-  notes: Note[] = []
-  status: SyncStatus = 'local'
-  userEmail: string | null = null
-  private sb: SupabaseClient | null = null
-  private listeners = new Set<() => void>()
-  private applyingRemote = false
-
-  subscribe(fn: () => void) { this.listeners.add(fn); return () => { this.listeners.delete(fn) } }
-  private emit() { this.listeners.forEach(f => f()) }
-
-  get sorted(): Todo[] {
-    return [...this.todos].sort((a, b) =>
-      Number(b.pinned) - Number(a.pinned) || a.position - b.position)
-  }
-
-  get sortedNotes(): Note[] {
-    return [...this.notes].sort((a, b) =>
-      Number(b.pinned) - Number(a.pinned) || b.updated_at - a.updated_at)
-  }
-
-  private initPromise: Promise<void> | null = null
-
-  init(): Promise<void> {
-    // 防止 StrictMode/重复调用导致的并发初始化
-    if (this.initPromise) return this.initPromise
-    this.initPromise = this.doInit().finally(() => { this.initPromise = null })
-    return this.initPromise
-  }
-
-  private async doInit() {
-    // 重连前清理旧客户端和频道
-    if (this.sb) {
-      try { await this.sb.removeAllChannels() } catch { /* ignore */ }
-      this.sb = null
-    }
-    this.todos = loadJson<Todo>(LS_TODOS)
-    this.notes = loadJson<Note>(LS_NOTES)
-    this.emit()
-    const cfg = loadCfg()
-    if (!cfg) return
-    this.status = 'connecting'
-    this.emit()
-    try {
-      this.sb = createClient(cfg.url, cfg.key, {
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
-      })
-      // 登录态变化监听：被登出时及时回到登录页
-      this.sb.auth.onAuthStateChange((event) => {
-        if (event === 'SIGNED_OUT') {
-          this.userEmail = null
-          this.status = 'need-auth'
-          this.emit()
-        }
-      })
-      // 检查登录态
-      const { data: { session } } = await this.sb.auth.getSession()
-      if (!session) {
-        this.userEmail = null
-        this.status = 'need-auth'
-        this.emit()
-        return
-      }
-      this.userEmail = session.user.email ?? null
-      // 账户归属校验：本机缓存若属于另一个账号，直接清空，绝不串号上传
-      const owner = localStorage.getItem(LS_OWNER)
-      if (owner !== this.userEmail) {
-        this.todos = []
-        this.notes = []
-        saveJson(LS_TODOS, [])
-        saveJson(LS_NOTES, [])
-        localStorage.setItem(LS_OWNER, this.userEmail || '')
-      }
-      // 合并两张表：云端为准，本地独有的（离线新增）补传上去
-      for (const table of ['todos', 'notes'] as const) {
-        const { data, error } = await this.sb.from(table).select('*')
-        if (error) throw error
-        const remote = (data || []) as any[]
-        const local = table === 'todos' ? this.todos : this.notes
-        const remoteIds = new Set(remote.map(t => t.id))
-        const localOnly = local.filter(t => !remoteIds.has(t.id))
-        if (localOnly.length) await this.sb.from(table).upsert(localOnly as any)
-        if (table === 'todos') this.todos = [...remote, ...localOnly] as Todo[]
-        else this.notes = [...remote, ...localOnly] as Note[]
-      }
-      saveJson(LS_TODOS, this.todos)
-      saveJson(LS_NOTES, this.notes)
-      this.status = 'online'
-      this.emit()
-      this.sb.channel('sticky-changes')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'todos' },
-          (payload) => this.onRemote('todos', payload))
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'notes' },
-          (payload) => this.onRemote('notes', payload))
-        .subscribe((s, err) => {
-          if (s === 'CHANNEL_ERROR') {
-            console.error('[sync] channel error', err)
-            this.status = 'error'; this.emit()
-          }
-        })
-    } catch (e) {
-      console.error('[sync] init failed', e)
-      this.status = 'error'
-      this.emit()
-    }
-  }
-
-  async reconnect(cfg: SupabaseCfg) {
-    saveCfg(cfg)
-    this.sb = null
-    this.status = 'connecting'
-    await this.init()
-  }
-
-  disconnect() {
-    saveCfg(null)
-    this.sb = null
-    this.status = 'local'
-    this.emit()
-  }
-
-  // ============ 登录 ============
-
-  private ensureClient(): SupabaseClient {
-    if (this.sb) return this.sb
-    const cfg = loadCfg()
-    if (!cfg) throw new Error('未配置云端')
-    this.sb = createClient(cfg.url, cfg.key)
-    return this.sb
-  }
-
-  async signIn(email: string, password: string): Promise<string | null> {
-    try {
-      const sb = this.ensureClient()
-      const { error } = await sb.auth.signInWithPassword({ email, password })
-      if (error) return error.message === 'Invalid login credentials' ? '邮箱或密码错误' : error.message
-      await this.init()
-      return null
-    } catch (e) { return String((e as any)?.message || e) }
-  }
-
-  async signUp(email: string, password: string): Promise<string | null> {
-    try {
-      const sb = this.ensureClient()
-      const { error } = await sb.auth.signUp({ email, password })
-      if (error) return error.message.includes('already registered') ? '该邮箱已注册，请直接登录' : error.message
-      await this.init()
-      return null
-    } catch (e) { return String((e as any)?.message || e) }
-  }
-
-  /** 手动刷新：断开重连并全量拉取云端数据 */
-  async refresh() {
-    this.initPromise = null
-    this.status = loadCfg() ? 'connecting' : 'local'
-    this.emit()
-    await this.init()
-  }
-
-  /** 从本地模式恢复默认云端同步 */
-  async enableCloud() {
-    localStorage.removeItem(LS_LOCAL_ONLY)
-    this.sb = null
-    this.status = 'connecting'
-    await this.init()
-  }
-
-  async signOut() {
-    if (this.sb) {
-      try { await this.sb.auth.signOut() } catch { /* ignore */ }
-    }
-    // 清空本机数据，防止下个账号看到上一账号内容
-    this.todos = []
-    this.notes = []
-    saveJson(LS_TODOS, [])
-    saveJson(LS_NOTES, [])
-    this.userEmail = null
-    this.status = 'need-auth'
-    this.emit()
-  }
-
-  private onRemote(table: 'todos' | 'notes', payload: any) {
-    this.applyingRemote = true
-    const { eventType, new: row, old } = payload
-    const list = table === 'todos' ? this.todos : this.notes
-    let next: any[]
-    if (eventType === 'DELETE') {
-      next = list.filter(t => t.id !== old.id)
-    } else {
-      const i = list.findIndex(x => x.id === row.id)
-      next = [...list]
-      if (i >= 0) next[i] = row
-      else next.push(row)
-    }
-    if (table === 'todos') { this.todos = next; saveJson(LS_TODOS, next) }
-    else { this.notes = next; saveJson(LS_NOTES, next) }
-    this.applyingRemote = false
-    this.emit()
-  }
-
-  private push(fn: (sb: SupabaseClient) => unknown) {
-    if (this.sb && !this.applyingRemote)
-      Promise.resolve(fn(this.sb)).catch(() => { this.status = 'error'; this.emit() })
-  }
-
-  private commitTodos(next: Todo[], pushFn?: (sb: SupabaseClient) => unknown) {
-    this.todos = next
-    saveJson(LS_TODOS, next)
-    this.emit()
-    if (pushFn) this.push(pushFn)
-  }
-
-  private commitNotes(next: Note[], pushFn?: (sb: SupabaseClient) => unknown) {
-    this.notes = next
-    saveJson(LS_NOTES, next)
-    this.emit()
-    if (pushFn) this.push(pushFn)
-  }
-
-  // ============ 待办 ============
-
-  add(text: string) {
-    // 新事项追加到列表底部
-    const maxPos = Math.max(-1, ...this.todos.filter(t => !t.done).map(t => t.position))
-    const todo: Todo = {
-      id: uid(), text, done: false, pinned: false,
-      position: maxPos + 1, created_at: Date.now(), completed_at: null,
-    }
-    this.commitTodos([...this.todos, todo], sb => sb.from('todos').insert(todo))
-  }
-
-  update(id: string, patch: Partial<Todo>) {
-    const next = this.todos.map(t => {
-      if (t.id !== id) return t
-      const merged = { ...t, ...patch }
-      if (patch.done === true && !t.done) merged.completed_at = Date.now()
-      if (patch.done === false) merged.completed_at = null
-      return merged
-    })
-    const row = next.find(t => t.id === id)!
-    this.commitTodos(next, sb => sb.from('todos').upsert(row))
-  }
-
-  remove(id: string) {
-    this.commitTodos(this.todos.filter(t => t.id !== id), sb => sb.from('todos').delete().eq('id', id))
-  }
-
-  reorder(id: string, beforeId: string | null) {
-    const list = this.sorted.filter(t => t.id !== id)
-    const item = this.todos.find(t => t.id === id)!
-    const idx = beforeId ? list.findIndex(t => t.id === beforeId) : list.length
-    const insertAt = idx < 0 ? list.length : idx
-    list.splice(insertAt, 0, item)
-    let pos = 0
-    const rePosed = list.map(t => ({ ...t, position: pos++ }))
-    const map = new Map(rePosed.map(t => [t.id, t]))
-    const next = this.todos.map(t => map.get(t.id) || t)
-    this.commitTodos(next, sb => sb.from('todos').upsert(rePosed))
-  }
-
-  // ============ 随笔 ============
-
-  addNote(title: string, content: string) {
-    const now = Date.now()
-    const note: Note = { id: uid(), title, content, pinned: false, updated_at: now, created_at: now }
-    this.commitNotes([...this.notes, note], sb => sb.from('notes').insert(note))
-    return note.id
-  }
-
-  updateNote(id: string, patch: Partial<Note>) {
-    const next = this.notes.map(n => n.id === id ? { ...n, ...patch, updated_at: Date.now() } : n)
-    const row = next.find(n => n.id === id)!
-    this.commitNotes(next, sb => sb.from('notes').upsert(row))
-  }
-
-  removeNote(id: string) {
-    this.commitNotes(this.notes.filter(n => n.id !== id), sb => sb.from('notes').delete().eq('id', id))
-  }
+ todos:Todo[]=[];notes:Note[]=[];status:SyncStatus='connecting';userEmail:string|null=null
+ visible=false;pending=0;revision=0;identity=0;private listeners=new Set<()=>void>()
+ private ledger:Ledger|null=null;private login:Session|null=null;private config:SupabaseCfg|null=null
+ private client:SupabaseClient|null=null;private authSub:{unsubscribe:()=>void}|null=null;private channel:ReturnType<SupabaseClient['channel']>|null=null
+ private abort=new AbortController();private started=false;private fence='';private boot=0;private request=0;private syncing=false;private again=false;private timer:ReturnType<typeof setTimeout>|null=null
+ private authBusy=false
+ subscribe=(fn:()=>void)=>{this.listeners.add(fn);return ()=>{this.listeners.delete(fn)}}
+ private emit(){this.revision++;this.listeners.forEach(f=>f())}
+ get sorted(){return [...this.todos].sort((a,b)=>Number(b.pinned)-Number(a.pinned)||a.position-b.position)}
+ get sortedNotes(){const key=this.ledger?.prefix+"note-order";const order:string[]=JSON.parse(localStorage.getItem(key)||"[]");const rank=new Map(order.map((id,i)=>[id,i]));return [...this.notes].sort((a,b)=>Number(b.pinned)-Number(a.pinned)||(rank.get(a.id)??-1)-(rank.get(b.id)??-1)||b.updated_at-a.updated_at||a.id.localeCompare(b.id))}
+ moveNoteOnto(id:string,target:string){if(!this.allowed())return;const all=this.sortedNotes,i=all.findIndex(n=>n.id===id),j=all.findIndex(n=>n.id===target);if(i<0||j<0||i===j||all[i].pinned!==all[j].pinned)return;all.splice(j,0,all.splice(i,1)[0]);localStorage.setItem(this.ledger!.prefix+"note-order",JSON.stringify(all.map(n=>n.id)));this.emit()}
+ private boundary(){return localStorage.getItem(ROOT+'access')||''}
+ private allowed(){return !!this.ledger&&this.fence===this.boundary()&&(this.ledger.space==='local'?!loadCfg():!!this.login)}
+ private clear(){this.identity++;this.request++;this.abort.abort();this.abort=new AbortController();this.login=null;this.ledger=null;this.userEmail=null;this.todos=[];this.notes=[];this.visible=false;this.pending=0;this.status='need-auth';this.syncing=false;this.again=false;if(this.timer)clearTimeout(this.timer);this.timer=null;const ch=this.channel;this.channel=null;if(ch&&this.client)void this.client.removeChannel(ch).catch(()=>{});this.emit()}
+ draftKey(name:string){return this.allowed()?this.ledger!.prefix+'draft:'+name:null}
+ get trash(){return this.allowed()?this.ledger!.trash():[]}
+ restoreTrash(key:string){if(this.allowed()){this.ledger!.restore(key);this.show();this.schedule()}}
+ private show(){if(!this.allowed()){this.clear();return}const b=this.ledger!.view();this.todos=b.todos as unknown as Todo[];this.notes=b.notes as unknown as Note[];this.pending=this.login?this.ledger!.ops().length:0;this.emit()}
+ private access(tag:string){const stamp=tag+'|'+crypto.randomUUID();localStorage.setItem(ROOT+'access',stamp);return stamp}
+ private async lock<T>(name:string,cb:()=>Promise<T>):Promise<T>{return navigator.locks.request(ROOT+name,cb)}
+ async init(){if(this.started)return;this.started=true;const purge=()=>{for(let i=localStorage.length-1;i>=0;i--){const k=localStorage.key(i);if(!k?.startsWith(ROOT)||!k.includes(':bin:'))continue;try{const x=JSON.parse(localStorage.getItem(k)!);if(Number.isFinite(x.deleted)&&x.deleted+30*86400000<=Date.now())localStorage.removeItem(k)}catch{}}};purge();setInterval(()=>{purge();this.emit()},60000)
+ window.addEventListener('storage',e=>{if(e.key===ROOT+'access'||e.key===LS_CFG||e.key===LS_LOCAL_ONLY||e.key===null){if(this.fence!==this.boundary()||e.key!==ROOT+'access'){this.clear();void this.prepare()}return}
+ if(this.ledger&&e.key?.startsWith(this.ledger.prefix)&&!e.key.slice(this.ledger.prefix.length).startsWith('draft:')){this.show();if(e.key.includes(':op:')&&e.newValue)this.schedule()}})
+ const focus=()=>{if(this.fence!==this.boundary()){this.clear();void this.prepare()}else if(this.login)this.schedule()};window.addEventListener('focus',focus);window.addEventListener('online',focus);document.addEventListener('visibilitychange',()=>{if(!document.hidden)focus()});setInterval(()=>{if(this.login&&!document.hidden)this.schedule()},30000)
+ await this.prepare()}
+ private async prepare(){const seq=++this.boot;this.clear();const cfg=loadCfg();const boundary=this.boundary();this.fence=boundary
+ if(!cfg){this.authSub?.unsubscribe();this.authSub=null;this.client=null;this.config=null;this.ledger=new Ledger(localStorage,'local');this.ledger.migrate('',true);this.visible=true;this.status='local';this.show();return}
+ if(!this.client||cfg.url!==this.config?.url||cfg.key!==this.config?.key){this.authSub?.unsubscribe();this.config=cfg;const client=this.client=createClient(cfg.url,cfg.key,{auth:{detectSessionInUrl:false}});this.authSub=client.auth.onAuthStateChange((event,session)=>{
+ if(this.client!==client||this.authBusy||event==='INITIAL_SESSION')return
+ if(event==='SIGNED_OUT'){this.boot++;this.clear();return}
+ if(session?.user.id!==this.login?.user.id){this.clear();queueMicrotask(()=>{if(this.client===client&&!this.authBusy)void this.prepare()})}
+ else if(session&&this.login){this.login=session;this.schedule()}
+ }).data.subscription}
+ if(boundary.startsWith('locked|'))return
+ this.status='connecting';this.emit()
+ try{const {data:{session},error}=await this.client!.auth.getSession();if(this.boot!==seq||this.boundary()!==boundary)return;if(error||!session){this.clear();return}this.activate(session,cfg,boundary)}catch{if(this.boot===seq)this.clear()}}
+ private activate(session:Session,cfg:SupabaseCfg,boundary:string){const scope=spaceId(cfg.url,session.user.id)
+ if(boundary&& !boundary.startsWith('user:'+encodeURIComponent(scope)+'|')){this.clear();return}
+ this.login=session;this.fence=boundary;const L=this.ledger=new Ledger(localStorage,scope);this.userEmail=session.user.email??null;this.visible=true;this.status='connecting';this.show()
+ const active=()=>this.ledger===L&&this.allowed();const sdk=this.client!
+ const channel=this.channel=sdk.channel('sticky-v15-'+crypto.randomUUID());for(const table of ['todos','notes'])channel.on('postgres_changes',{event:'*',schema:'public',table},()=>{if(active())this.schedule()});channel.subscribe();this.schedule()
+ }
+ private async migrateLegacy(L:Ledger,session:Session,cfg:SupabaseCfg,active:()=>boolean){
+  if(cfg.url!==String(import.meta.env.VITE_SUPABASE_URL||'')||localStorage.getItem(ROOT+'legacy-claim')||!session.user.email||localStorage.getItem('sticky-todo-owner')?.trim().toLowerCase()!==session.user.email.trim().toLowerCase())return
+  // On a failed first launch offline this is retried at the next foreground sync.
+  const {data,error}=await this.client!.auth.getUser(session.access_token)
+  if(error||data.user?.id!==session.user.id||!data.user.email_confirmed_at||!active())return
+  await this.lock('legacy-import',async()=>{if(active()){L.migrate(data.user!.email||'',false);this.show()}})
+ }
+ private schedule(){if(!this.login||!this.allowed()||this.timer)return;if(this.syncing){this.again=true;return}this.timer=setTimeout(()=>{this.timer=null;void this.flush()},70)}
+ private async flush(){const L=this.ledger,session=this.login,cfg=this.config;if(!L||!session||!cfg||!this.allowed())return;const gen=this.request;const active=()=>gen===this.request&&this.ledger===L&&this.allowed();const signal=this.abort.signal;this.syncing=true
+ try{await this.lock('sync:'+L.space,async()=>{if(!active())return;await this.migrateLegacy(L,session,cfg,active);if(!active())return;const api=new AccountApi({...cfg,token:session.access_token,user:session.user},signal);const ok=await reconcile(L,api,active);if(active()){this.status=ok?'online':'error';this.show()}})}catch{if(active()){this.status='error';this.show()}}finally{if(gen===this.request){this.syncing=false;if(this.again){this.again=false;this.schedule()}}}}
+ async refresh(){if(this.login){this.schedule();return}await this.prepare()}
+ async reconnect(cfg:SupabaseCfg){this.clear();this.access('locked');saveCfg(cfg);await this.prepare()}
+ disconnect(){this.clear();this.access('locked');saveCfg(null);void this.prepare()}
+ async enableCloud(){this.clear();localStorage.removeItem(LS_LOCAL_ONLY);this.access('locked');await this.prepare()}
+ async signOut(){const sdk=this.client;this.boot++;this.access('locked');this.clear();this.fence=this.boundary()
+ await this.lock('auth',async()=>{if(!this.boundary().startsWith('locked|'))return;this.authBusy=true;try{await sdk?.auth.signOut({scope:'local'})}catch{/* Local gate remains locked offline. */}finally{this.authBusy=false}})}
+ private async auth(mode:'signInWithPassword'|'signUp',email:string,password:string):Promise<string|null>{
+ return this.lock('auth',async()=>{if(!this.client)await this.prepare();const sdk=this.client;if(!sdk||!this.config)return '未配置云端'
+ this.authBusy=true;this.boot++;this.access('locked');this.clear()
+ try{const {data,error}=await sdk.auth[mode]({email,password});if(error)return error.message;if(!data.session)return '请先完成邮箱验证，再登录';const scope=spaceId(this.config.url,data.session.user.id);const mark=this.access('user:'+encodeURIComponent(scope));this.activate(data.session,this.config,mark);return null}
+ catch{return '登录失败，请检查网络后重试'}finally{this.authBusy=false}})}
+ signIn(email:string,password:string){return this.auth('signInWithPassword',email,password)}
+ private async proofRequest(path:string,data:object,token?:string){const c=loadCfg();if(!c)throw Error("未配置同步");const r=await fetch(new URL("/auth/v1/"+path,c.url),{method:token?"PUT":"POST",redirect:"error",headers:{apikey:c.key,"Content-Type":"application/json",...(token?{Authorization:"Bearer "+token}:{})},body:JSON.stringify(data),signal:AbortSignal.timeout(15000)});const text=await r.text();let result:any={};try{result=text?JSON.parse(text):{}}catch{};if(!r.ok){const code=result.error_code||result.code;throw Object.assign(Error(r.status===429?"请求较频繁，请稍后再试。":path==="user"?(code==="same_password"?"邮箱已验证。这个密码就是原密码，请直接登录。":code==="weak_password"?"邮箱已验证，但新密码强度不足。请重新申请验证码并换一个更强的密码。":"邮箱已验证，但密码没有修改成功。请重试找回流程。"):path==="verify"?"验证码错误或已失效，请核对最新邮件。":"未能发送邮件，请稍后再试。"),{code})}return result}
+ async beginSignup(email:string){await this.proofRequest("otp",{email,create_user:true})}
+ async beginRecovery(email:string){await this.proofRequest("recover",{email})}
+ async confirmSignup(email:string,password:string,proof:string,recovery=false){const c=loadCfg();if(!c)throw Error("未配置同步");let payload:object;if(/^[0-9]{6,10}$/.test(proof))payload={type:recovery?"recovery":"email",email,token:proof};else{let u=new URL(/^(www\.)?google\.com\/url\?/.test(proof)?"https://"+proof:proof);if(u.protocol==="https:"&&["google.com","www.google.com"].includes(u.hostname)&&u.pathname==="/url")u=new URL(u.searchParams.get("q")||u.searchParams.get("url")||"");const type=u.searchParams.get("type"),token=u.searchParams.get("token")||u.searchParams.get("token_hash");if(u.origin!==new URL(c.url).origin||u.username||u.password||u.pathname!=="/auth/v1/verify"||!(recovery?["recovery"]:["signup","email","magiclink"]).includes(type||"")||!token)throw Error("请使用本次操作的最新邮件验证码或原始链接");payload={type,token_hash:token}}const x=await this.proofRequest("verify",payload);if(!x.access_token||x.user?.email?.toLowerCase()!==email.toLowerCase())throw Error("验证邮箱不匹配");await this.proofRequest("user",{password},x.access_token);return recovery?null:this.signIn(email,password)}
+ private edit(k:Kind,type:Op['type'],r:Row,patch:Partial<Row>={}){if(!this.allowed())return;try{if(type==='delete')this.ledger!.recycle(k,r);else this.ledger!.edit(k,type,r,patch);this.show();this.schedule()}catch{window.alert('未能保存到本机，请保留输入并检查磁盘空间。');throw Error('本机保存失败')}}
+ add(text:string){const now=Date.now();this.edit('todos','add',{id:uid(),text,done:false,pinned:false,position:Math.max(-1,...this.todos.filter(t=>!t.done).map(t=>t.position))+1,created_at:now,completed_at:null})}
+ update(id:string,patch:Partial<Todo>){const e=this.todos.find(t=>t.id===id);if(!e)return;const p={...patch};if(p.done!==undefined&&p.done!==e.done)p.completed_at=p.done?Date.now():null;this.edit('todos','patch',{...e,...p},p)}
+ remove(id:string){const e=this.todos.find(t=>t.id===id);if(e)this.edit('todos','delete',{...e})}
+ moveOnto(id:string,target:string){const a=this.peers(id),i=a.findIndex(t=>t.id===id),j=a.findIndex(t=>t.id===target);if(i<0||j<0||i===j)return;a.splice(j,0,a.splice(i,1)[0]);a.forEach((r,n)=>{if(r.position!==n)this.update(r.id,{position:n})})}
+ private peers(id:string){const e=this.todos.find(r=>r.id===id);return this.sorted.filter(r=>!r.done&&r.pinned===e?.pinned)}
+ moveLimit(id:string,d:number){const a=this.peers(id),i=a.findIndex(r=>r.id===id);return i<0||!a[i+d]}
+ move(id:string,d:number){const a=this.peers(id),i=a.findIndex(r=>r.id===id);if(i<0||!a[i+d])return;[a[i],a[i+d]]=[a[i+d],a[i]];a.forEach((r,n)=>{if(r.position!==n)this.update(r.id,{position:n})})}
+ reorder(id:string,before:string|null){const e=this.todos.find(t=>t.id===id);if(!e)return;const a=this.sorted.filter(t=>t.id!==id);const i=a.findIndex(t=>t.id===before);a.splice(i<0?a.length:i,0,e);a.forEach((r,n)=>{if(r.position!==n)this.update(r.id,{position:n})})}
+ addNote(title:string,content:string){const id=uid(),now=Date.now();this.edit('notes','add',{id,title,content,pinned:false,updated_at:now,created_at:now});return id}
+ updateNote(id:string,patch:Partial<Note>){const e=this.notes.find(n=>n.id===id);if(!e)return;const p={...patch,updated_at:Date.now()};this.edit('notes','patch',{...e,...p},p)}
+ removeNote(id:string){const e=this.notes.find(n=>n.id===id);if(e)this.edit('notes','delete',{...e})}
 }
-
-export const store = new TodoStore()
+export const store=new TodoStore()

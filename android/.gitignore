@@ -1,0 +1,8 @@
+.gradle/
+**/build/
+local.properties
+*.keystore
+*.jks
+*.apk
+
+app/src/main/assets/client.json

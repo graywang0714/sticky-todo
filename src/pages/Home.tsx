@@ -1,3 +1,6 @@
+import {TodoActions} from "../components/TodoActions"
+import {ReorderMark} from '../components/ReorderMark'
+import {useScopedDraft} from '@/lib/useScopedDraft'
 import { useEffect, useRef, useState } from 'react'
 import { store } from '@/lib/store'
 import type { Todo, Note } from '@/lib/store'
@@ -6,7 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Pin, PinOff, Trash2, GripVertical, ChevronDown, ChevronRight, Cloud, CloudOff, Cloudy, Plus, ArrowLeft, Undo2, UserRound, RefreshCw } from 'lucide-react'
+import { Pin, PinOff, Trash2, ChevronDown, ChevronRight, Cloud, CloudOff, Cloudy, Plus, ArrowLeft, Undo2, UserRound, RefreshCw } from 'lucide-react'
 
 function useStore() {
   const [, setV] = useState(0)
@@ -30,20 +33,19 @@ function timeLabel(ts: number) {
 }
 
 export default function Home() {
-  const snap = useStore()
-  const [tab, setTab] = useState<'todo' | 'note'>('todo')
-  const [text, setText] = useState('')
-  const [editing, setEditing] = useState<string | null>(null)
-  const [editText, setEditText] = useState('')
+  const snap = useStore();const [bin,setBin]=useState(false)
+  const [tab, setTab] = useScopedDraft<'todo' | 'note'>('Home:tab','todo')
+  const [text, setText] = useScopedDraft('Home:text','')
+  const [editing, setEditing] = useScopedDraft<string | null>('Home:editing',null)
+  const [editText, setEditText] = useScopedDraft('Home:editText','')
   const [showArchive, setShowArchive] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showAccount, setShowAccount] = useState(false)
   // 随笔编辑状态：null=列表，'new'=新建，否则为笔记 id
-  const [noteId, setNoteId] = useState<string | null | 'new'>(null)
-  const [noteTitle, setNoteTitle] = useState('')
-  const [noteContent, setNoteContent] = useState('')
+  const [noteId, setNoteId] = useScopedDraft<string | null | 'new'>('Home:noteId',null)
+  const [noteTitle, setNoteTitle] = useScopedDraft('Home:noteTitle','')
+  const [noteContent, setNoteContent] = useScopedDraft('Home:noteContent','')
   const [armed, setArmed] = useState<{ id: string; dir: 'left' | 'right' } | null>(null)
-  const dragId = useRef<string | null>(null)
   const touchTimer = useRef<ReturnType<typeof setTimeout>>(undefined as any)
   // 滑动手势状态
   const [swipe, setSwipe] = useState<{ id: string; dx: number } | null>(null)
@@ -174,16 +176,16 @@ export default function Home() {
           <h1 className="text-xl font-bold tracking-wide text-stone-700 drop-shadow-sm">📒 Sticky Notes</h1>
           <div className="flex items-center gap-2">
             <span title={statusText} className="flex items-center gap-1 text-xs text-stone-500">
-              {statusIcon}{statusText}
+              {statusIcon}{statusText}{store.pending>0 ? ' · '+store.pending+' 项待同步' : ''}
             </span>
-            {(snap.status === 'online' || snap.status === 'connecting') && (
+            {store.userEmail && (
               <button
                 className="p-1.5 rounded-full hover:bg-black/5 transition"
                 title="手动同步"
                 onClick={() => store.refresh()}
               ><RefreshCw className={`w-4 h-4 text-stone-500 ${snap.status === 'connecting' ? 'animate-spin' : ''}`} /></button>
             )}
-            {snap.status === 'online' && (
+            {store.userEmail && (
               <button
                 className="p-1.5 rounded-full hover:bg-black/5 transition"
                 title="个人中心"
@@ -193,7 +195,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 标签页 */}
+        <button onClick={()=>setBin(true)} className="mb-2 text-xs text-stone-600">回收站</button><Dialog open={bin} onOpenChange={setBin}><DialogContent><DialogHeader><DialogTitle>回收站</DialogTitle></DialogHeader><p>此设备删除的记录保留 30 天。</p><div className="max-h-[55vh] overflow-auto">{store.trash.length===0?"回收站为空":store.trash.map(x=><div key={x.key} className="flex items-center justify-between border-b py-2"><span>{x.row.text||x.row.title||"随笔"}<small className="block">剩余 {Math.ceil((x.deleted+30*86400000-Date.now())/86400000)} 天</small></span><Button onClick={()=>store.restoreTrash(x.key)}>恢复</Button></div>)}</div></DialogContent></Dialog>
         <div className="flex gap-1 mb-4 bg-white/40 rounded-lg p-1 w-fit">
           {(['todo', 'note'] as const).map(k => (
             <button
@@ -219,14 +221,14 @@ export default function Home() {
             </div>
 
             {/* 待办列表 */}
-            <div className="space-y-2">
+            <div data-todo-list className="space-y-2">
               {active.length === 0 && (
                 <div className="text-center text-stone-400 text-sm py-10">暂无待办，享受当下 ✨</div>
               )}
               {active.map(t => {
                 const dx = swipe?.id === t.id ? swipe.dx : (armed?.id === t.id ? (armed.dir === 'right' ? 92 : -92) : 0)
                 return (
-                <div key={t.id} className="relative overflow-hidden rounded-lg">
+                <div key={t.id} data-todo-id={t.id} data-pinned={t.pinned} className="relative overflow-hidden rounded-lg">
                   {/* 右滑底层：完成按钮（常驻左侧，卡片右滑露出即可点） */}
                   <div className="absolute inset-y-0 left-0 flex items-center pl-2">
                     <button
@@ -249,10 +251,6 @@ export default function Home() {
                     ><Trash2 className="w-4 h-4" /></button>
                   </div>
                 <div
-                  draggable
-                  onDragStart={() => { dragId.current = t.id }}
-                  onDragOver={e => e.preventDefault()}
-                  onDrop={() => { if (dragId.current && dragId.current !== t.id) store.reorder(dragId.current, t.id); dragId.current = null }}
                   onTouchStart={e => onTouchStartItem(t, e)}
                   onTouchMove={e => onTouchMoveItem(t, e)}
                   onTouchEnd={() => onTouchEndItem(t)}
@@ -261,15 +259,12 @@ export default function Home() {
                     transition: swipe?.id === t.id ? 'none' : 'transform 0.25s ease',
                     touchAction: 'pan-y',
                   }}
-                  className="group relative flex items-center gap-2 bg-white rounded-lg px-3 py-2.5 shadow-sm border border-amber-100 hover:shadow transition sm:hover:-translate-x-[92px]"
+                  className="group relative flex items-center gap-2 bg-white rounded-lg px-3 py-2.5 shadow-sm border border-amber-100 hover:shadow transition"
                 >
-                  <GripVertical className="w-4 h-4 text-stone-300 cursor-grab shrink-0 max-sm:hidden" />
+
                   {/* 圆点（点击即完成，与 Done 页样式一致） */}
-                  <button
-                    className="w-2.5 h-2.5 rounded-full bg-stone-400/70 hover:bg-emerald-500 shrink-0 transition-colors"
-                    title="完成"
-                    onClick={() => store.update(t.id, { done: true })}
-                  />
+                  <ReorderMark id={t.id} pinned={t.pinned}/>
+
                   {editing === t.id ? (
                     <input
                       autoFocus
@@ -291,7 +286,8 @@ export default function Home() {
                       }}
                     >{t.text}</span>
                   )}
-                </div>
+                <TodoActions t={t}/>
+</div>
                 </div>
                 )
               })}
@@ -342,18 +338,18 @@ export default function Home() {
               onClick={() => { setNoteId('new'); setNoteTitle(''); setNoteContent('') }}
               className="w-full mb-4 bg-amber-500 hover:bg-amber-600 text-white shadow-sm"
             ><Plus className="w-4 h-4 mr-1" />写一条随笔</Button>
-            <div className="space-y-2">
+            <div data-todo-list className="space-y-2">
               {store.sortedNotes.length === 0 && (
                 <div className="text-center text-stone-400 text-sm py-10">还没有随笔。密码、地址、常用账号…记在这里不会丢 📝</div>
               )}
               {store.sortedNotes.map(n => (
                 <div
-                  key={n.id}
+                  key={n.id} data-todo-id={n.id} data-pinned={n.pinned}
                   className="group bg-white rounded-lg px-3 py-2.5 shadow-sm border border-amber-100 hover:shadow transition cursor-pointer"
                   onClick={() => openNote(n)}
                 >
                   <div className="flex items-center gap-2">
-                    {n.pinned === true && <Pin className="w-3.5 h-3.5 text-amber-600 shrink-0" />}
+                    <ReorderMark kind="notes" id={n.id} pinned={n.pinned}/>
                     <span className="flex-1 font-medium text-[15px] truncate">{n.title || '无标题'}</span>
                     <button
                       className="opacity-0 group-hover:opacity-100 transition p-1"
@@ -398,7 +394,7 @@ export default function Home() {
                   退出登录
                 </Button>
               </div>
-              <p className="text-xs text-stone-400 text-center">退出后回到登录页，云端数据不会丢失</p>
+              <p className="text-xs text-stone-400 text-center">退出后隐藏本账号记录。未同步的修改留在本机，下次登录此账号后继续同步。</p>
               <button
                 className="w-full text-xs text-stone-300 hover:text-stone-500 text-center transition"
                 onClick={() => {

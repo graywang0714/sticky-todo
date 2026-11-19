@@ -1,0 +1,1 @@
+const {contextBridge,ipcRenderer}=require('electron');contextBridge.exposeInMainWorld('appearanceSettings',{read:()=>ipcRenderer.invoke('float-pref:get'),save:v=>ipcRenderer.invoke('float-pref:save',v)});

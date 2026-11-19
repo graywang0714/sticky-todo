@@ -28,5 +28,5 @@ try {
     </StrictMode>,
   )
 } catch (e) {
-  document.body.innerHTML = '<pre style="color:red;padding:20px">启动失败: ' + String(e) + '</pre>'
+  document.body.textContent = "启动失败，请重新打开应用。"
 }

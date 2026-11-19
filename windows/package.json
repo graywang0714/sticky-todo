@@ -1,0 +1,49 @@
+{
+  "name": "sticky-notes",
+  "version": "1.9.0",
+  "description": "Gray Note desktop",
+  "main": "main.js",
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "build:renderer": "node build-renderer.cjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "productName": "Sticky Notes",
+  "build": {
+    "appId": "com.graywang.stickynotes",
+    "win": {
+      "target": [
+        "portable"
+      ],
+      "icon": "icon.ico"
+    },
+    "portable": {
+      "artifactName": "Sticky-Notes-Windows-v1.9.0.exe"
+    },
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "preferences.cjs",
+      "appearance.cjs",
+      "settings.html",
+      "settings.js",
+      "settings-preload.cjs",
+      "settings.css",
+      "icon-192.png",
+      "icon-512.png",
+      "bundled-ui.cjs",
+      "renderer/**/*"
+    ],
+    "electronVersion": "44.4.3"
+  },
+  "devDependencies": {
+    "electron": "^44.4.3",
+    "electron-builder": "^26.15.3"
+  }
+}

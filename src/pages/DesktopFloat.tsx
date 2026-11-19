@@ -1,8 +1,11 @@
+import {TodoActions} from "../components/TodoActions"
+import {ReorderMark} from '../components/ReorderMark'
+import {useScopedDraft} from '@/lib/useScopedDraft'
 import { useEffect, useState } from 'react'
 import { store } from '@/lib/store'
 import type { Todo, Note } from '@/lib/store'
 import LoginScreen from '@/pages/LoginScreen'
-import { Pin, PinOff, Plus, X, Check, Trash2, Undo2, Lock, LockOpen, RefreshCw } from 'lucide-react'
+import { Pin, PinOff, Plus, X, Trash2, Undo2, Lock, LockOpen, RefreshCw } from 'lucide-react'
 
 function useStore() {
   const [, setV] = useState(0)
@@ -92,9 +95,9 @@ function WinBar({ title }: { title: string }) {
 function NotesPanel() {
   useStore()
   const panelCls = usePanelCls()
-  const [editNote, setEditNote] = useState<Note | 'new' | null>(null)
-  const [title, setTitle] = useState('')
-  const [content, setContent] = useState('')
+  const [editNote, setEditNote] = useScopedDraft<Note | 'new' | null>('DesktopFloat:editNote',null)
+  const [title, setTitle] = useScopedDraft('DesktopFloat:title','')
+  const [content, setContent] = useScopedDraft('DesktopFloat:content','')
   const notes = store.sortedNotes
 
   const openEdit = (n: Note | 'new') => {
@@ -122,12 +125,12 @@ function NotesPanel() {
           <Plus className="w-5 h-5" />
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto px-4 pb-3 space-y-3" style={{ scrollbarWidth: 'thin' }}>
+      <div data-todo-list className="flex-1 overflow-y-auto px-4 pb-3 space-y-3" style={{ scrollbarWidth: 'thin' }}>
         {notes.length === 0 && <div className="text-sm text-white/60">暂无随笔，点右上角 ＋ 添加</div>}
         {notes.map(n => (
-          <div key={n.id} className="cursor-pointer group" onClick={() => openEdit(n)}>
+          <div key={n.id} data-todo-id={n.id} data-pinned={n.pinned} className="cursor-pointer group" onClick={() => openEdit(n)}>
             <div className="flex items-center gap-1.5">
-              {n.pinned && <Pin className="w-3 h-3 text-amber-300" />}
+              <ReorderMark id={n.id} pinned={n.pinned} kind="notes"/>
               <span className="font-bold text-[15px] flex-1 truncate">{n.title || '无标题'}</span>
               <span className="hidden group-hover:flex items-center gap-1" style={noDrag}>
                 <button className="p-0.5 hover:bg-white/15 rounded" title={n.pinned ? '取消置顶' : '置顶'}
@@ -167,11 +170,11 @@ function NotesPanel() {
 function TodosPanel() {
   useStore()
   const panelCls = usePanelCls()
-  const [page, setPage] = useState<'todo' | 'done'>('todo')
-  const [quickAdd, setQuickAdd] = useState('')
-  const [showAdd, setShowAdd] = useState(false)
-  const [editing, setEditing] = useState<string | null>(null)
-  const [editText, setEditText] = useState('')
+  const [page, setPage] = useScopedDraft<'todo' | 'done'>('DesktopFloat:page','todo')
+  const [quickAdd, setQuickAdd] = useScopedDraft('DesktopFloat:quickAdd','')
+  const [showAdd, setShowAdd] = useScopedDraft('DesktopFloat:showAdd',false)
+  const [editing, setEditing] = useScopedDraft<string | null>('DesktopFloat:editing',null)
+  const [editText, setEditText] = useScopedDraft('DesktopFloat:editText','')
 
   const active = store.sorted.filter(t => !t.done)
   const doneList = [...store.todos].filter(t => t.done)
@@ -194,9 +197,9 @@ function TodosPanel() {
       <div className="flex items-center justify-between px-4 pt-1 pb-2">
         <div className="flex items-baseline gap-3">
           <button onClick={() => setPage('todo')}
-            className={`text-2xl font-extrabold transition ${page === 'todo' ? '' : 'text-white/35 hover:text-white/60'}`}>Todo</button>
+            aria-pressed={page === 'todo'} className="sticky-view-tab text-2xl font-extrabold">Todo</button>
           <button onClick={() => setPage('done')}
-            className={`text-2xl font-extrabold transition ${page === 'done' ? '' : 'text-white/35 hover:text-white/60'}`}>Done</button>
+            aria-pressed={page === 'done'} className="sticky-view-tab text-2xl font-extrabold">Done</button>
         </div>
         {page === 'todo' && (
           <button onClick={() => setShowAdd(v => !v)} className="p-1 hover:bg-white/15 rounded" title="快速添加" style={noDrag}>
@@ -208,15 +211,11 @@ function TodosPanel() {
       <div className="flex-1 overflow-y-auto px-4 pb-3 flex flex-col" style={{ scrollbarWidth: 'thin' }}>
         {page === 'todo' ? (
           <>
-            <div className="space-y-1.5">
+            <div data-todo-list className="space-y-1.5">
               {active.length === 0 && !showAdd && <div className="text-sm text-white/60">暂无待办，点击下方空白处记录第一条 ✨</div>}
               {active.map(t => (
-                <div key={t.id} className="flex items-center gap-2 group">
-                  <button
-                    onClick={() => store.update(t.id, { done: true })}
-                    title="完成"
-                    className="w-2.5 h-2.5 rounded-full bg-white/60 hover:bg-emerald-400 shrink-0 transition-colors"
-                  />
+                <div key={t.id} data-todo-id={t.id} data-pinned={t.pinned} className="flex items-center gap-2 group">
+                  <ReorderMark id={t.id} pinned={t.pinned}/>
                   {editing === t.id ? (
                     <input autoFocus value={editText}
                       onChange={e => setEditText(e.target.value)}
@@ -229,18 +228,8 @@ function TodosPanel() {
                       onClick={() => { setEditing(t.id); setEditText(t.text) }}>{t.text}</span>
                   )}
                   <span className="hidden group-hover:flex items-center gap-0.5 shrink-0" style={noDrag}>
-                    <button className="p-1 rounded-full bg-emerald-500/90 hover:bg-emerald-400" title="完成"
-                      onClick={() => store.update(t.id, { done: true })}>
-                      <Check className="w-3 h-3" />
-                    </button>
-                    <button className="p-1 rounded-full bg-amber-500/90 hover:bg-amber-400" title={t.pinned ? '取消置顶' : '置顶'}
-                      onClick={() => store.update(t.id, { pinned: !t.pinned })}>
-                      {t.pinned ? <PinOff className="w-3 h-3" /> : <Pin className="w-3 h-3" />}
-                    </button>
-                    <button className="p-1 rounded-full bg-red-500/90 hover:bg-red-400" title="删除"
-                      onClick={() => store.remove(t.id)}>
-                      <X className="w-3 h-3" />
-                    </button>
+
+<TodoActions t={t}/>
                   </span>
                 </div>
               ))}

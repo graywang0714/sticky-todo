@@ -1,0 +1,11 @@
+const test=require('node:test'),assert=require('node:assert/strict'),ts=require('typescript'),fs=require('node:fs');
+require.extensions['.ts']=(m,p)=>m._compile(ts.transpileModule(fs.readFileSync(p,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,p);
+const {AccountApi}=require('../../src/lib/desktop-sync.ts');
+test('database reads fail closed when a returned record belongs to another account',async t=>{t.mock.method(global,'fetch',async(u,req)=>{assert.equal(u.searchParams.get('user_id'),'eq.A');assert.equal(req.headers.Authorization,'Bearer test-A');return Response.json([{id:'same',user_id:'B',text:'private'}])});const api=new AccountApi({url:'https://fixture.invalid',key:'test-only',token:'test-A',user:{id:'A'}},new AbortController().signal);await assert.rejects(api.all('todos'),/归属/)});
+test('insert forces owner; update and delete are scoped by owner AND record id',async t=>{const seen=[];t.mock.method(global,'fetch',async(u,req)=>{seen.push([req.method,u.searchParams.get('user_id'),u.searchParams.get('id'),req.body&&JSON.parse(req.body).user_id]);return Response.json([{id:'same',user_id:'A',text:'fixture'}])});const api=new AccountApi({url:'https://fixture.invalid',key:'test-only',token:'test-A',user:{id:'A'}},new AbortController().signal);await api.add('todos',{id:'same',user_id:'B',text:'fixture'});await api.change('todos','same',{text:'next'});await api.change('todos','same',null);assert.deepEqual(seen,[['POST',null,null,'A'],['PATCH','eq.A','eq.same',undefined],['DELETE','eq.A','eq.same',undefined]])});
+test('241 historical todos span two real PostgREST-style pages; simple operators compare literal values',async t=>{
+ const all=Array.from({length:241},(_,i)=>({id:'task-'+String(i).padStart(3,'0'),text:'fixture',user_id:'A'}));const cursors=[];
+ t.mock.method(global,'fetch',async u=>{const raw=u.searchParams.get('id');cursors.push(raw);const after=raw?raw.slice(3):'';return Response.json(all.filter(r=>r.id>after).slice(0,Number(u.searchParams.get('limit'))))});
+ const api=new AccountApi({url:'https://fixture.invalid',key:'public-test',token:'test',user:{id:'A'}},new AbortController().signal);
+ assert.deepEqual((await api.all('todos')).map(r=>r.id),all.map(r=>r.id));assert.deepEqual(cursors,[null,'gt.task-199'])
+});
